@@ -1,0 +1,198 @@
+# Mini Agent — 简化版独立 Cordis 组合（Windows pwsh / POSIX bash 双平台）
+#
+# 模板：deepseek-harness/examples/jsonrpc-agent/minimal.cordis.yml
+# 差异：
+#   1. PTY 持久 bash 栈（仅 POSIX）替换为平台条件的单发 shell：
+#      win32 → dsh-pwsh-local + dsh-tool-pwsh；POSIX → dsh-bash-local + dsh-tool-bash
+#   2. agent-spine 开启 workspaceContext（AGENTS.md/CLAUDE.md 三层记忆，文章一）
+#      与 skills（SKILL.md 菜单 + 按需加载，文章五）
+# 能力对照《万字长文拆解 Agent 架构设计》系列，映射关系见 README.md。
+#
+# 信任边界两档（sandbox-policy）：
+#   默认 danger-full-access —— 与官方 minimal 示例一致，shell 与编辑器可修改
+#   运行时进程可访问的任何路径，请在可丢弃的目录中运行；
+#   repl.py --safe 设 DSH_SANDBOX_MODE=workspace-write —— 写操作限制在
+#   workspaceRoot（DSH_CWD）内，读写工作区外会被沙箱拒绝。
+
+- id: sdk-jsonrpc-server
+  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
+  config:
+    maxTokensAsSuccess: false
+
+- id: llm-deepseek
+  name: '@deepseek-ai/dsh-llm-deepseek'
+  config:
+    apiKeyEnv: DEEPSEEK_API_KEY
+    streamIdleTimeoutMs: 172800000
+    models:
+      - id: !!js process.env.DSH_MODEL ?? 'deepseek-v4-flash'
+        contextWindow: !!js Number(process.env.DSH_CONTEXT_WINDOW ?? 1000000)
+
+- id: sandbox
+  name: '@deepseek-ai/dsh-sandbox-local'
+
+- id: sandbox-policy
+  name: '@deepseek-ai/dsh-sandbox-policy'
+  config:
+    mode: !!js process.env.DSH_SANDBOX_MODE ?? 'danger-full-access'
+    workspaceRoot: !!js process.env.DSH_CWD ?? process.cwd()
+
+- id: subprocess
+  name: '@deepseek-ai/dsh-subprocess-local'
+
+# ── shell：平台条件单发执行器 + 模型可见工具（同一份组合双平台）─────────────
+# shell-env 发布 shell 环境注册表（tool-pwsh / tool-bash 的 shellEnv 依赖）。
+# 执行器用 sandbox 孪生包（与 *-local 同 Config，取代其注册 ctx.shell）：
+# danger-full-access 下逐命令透传、行为与 local 一致；--safe（workspace-write）
+# 下 Windows 走 ACL 受限令牌链、Linux/macOS 走 bwrap/Landlock/Seatbelt 真实限制。
+- id: shell-env
+  name: '@deepseek-ai/dsh-shell-env'
+
+- id: pwsh-sandbox
+  name: '@deepseek-ai/dsh-pwsh-sandbox'
+  disabled: !!js process.platform !== 'win32'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+    timeoutMs: 120000
+
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+  disabled: !!js process.platform !== 'win32'
+
+- id: bash-sandbox
+  name: '@deepseek-ai/dsh-bash-sandbox'
+  disabled: !!js process.platform === 'win32'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+    timeoutMs: 120000
+
+- id: tool-bash
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled: !!js process.platform === 'win32'
+
+# ── 文件系统：裸本地后端 + 字符串替换编辑器 ─────────────────────────────────
+- id: fs-local
+  name: '@deepseek-ai/dsh-fs-local'
+  config:
+    cwd: !!js process.env.DSH_CWD ?? process.cwd()
+
+- id: str-replace-editor
+  name: '@deepseek-ai/dsh-tool-str-replace-editor'
+  config:
+    maxOutputChars: 16000
+
+# ── Agent 核心：Loop / 工具目录 / 系统提示词装配 / 技能 ─────────────────────
+- id: agent-spine
+  name: '@deepseek-ai/dsh-agent-spine-demo'
+  config:
+    includeHarnessIdentity: false
+    includeRuntimeContext: false
+    persona: !!js process.env.DSH_SYSTEM_PROMPT ?? 'You are Mini, a concise coding agent. Prefer reading before editing, verify changes by running commands, and keep replies short and structured.'
+    # 三层记忆：~/.dsh/AGENTS.md（全局）+ 项目根/当前目录的 AGENTS.md|CLAUDE.md（+ .local 覆盖层）
+    workspaceContext:
+      maxBytes: 8192
+    # 技能系统：name+description 菜单常驻系统提示词，正文经 skill 工具按需加载
+    skills:
+      enabled: true
+      filesystem:
+        customSkillDirs:
+          - !!js "process.getBuiltinModule('node:url').fileURLToPath(new URL('skills/', baseUrl))"
+    toolBash: false
+    toolJobs: false
+
+# ── 时间感知：LLM 拼图补丁（"它甚至不知道现在几点"）─────────────────────────
+# 每步注入带时区的当前时间与流逝时长；refreshIntervalMs 避免每步重复注入。
+- id: time-context
+  name: '@deepseek-ai/dsh-time-context'
+  config:
+    timeZone: Asia/Shanghai
+    refreshIntervalMs: 60000
+
+# ── MCP：外部 Model Context Protocol 服务器工具桥接 ──────────────────────────
+# 每个 MCP 服务器一个插件实例；工具以 mcp__<serverName>__<原名> 注册为原生工具。
+# 内置两个演示：
+#   demo — echo 服务器（mcp/demo_server.py，模型可见 mcp__demo__echo）
+#   kb   — 知识库检索服务器（mcp/knowledge_server.py，mcp__kb__search，
+#          RAG 拼图的最小 agentic 实现：模型在 Loop 中检索 knowledge/*.md）
+# 注意：工具目录按轮冻结（KV cache 稳定性），握手完成前发起的首轮可能看不到
+# MCP 工具，下一轮起可见；REPL 已在启动时预热 runtime 来规避。
+# failOnStartupError 保持 false：演示服务器不可用时 agent 其余功能不受影响。
+- id: mcp-demo
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: demo
+    transport: stdio
+    command: !!js process.env.DSH_MCP_DEMO_PYTHON ?? 'python'
+    args:
+      - !!js "process.getBuiltinModule('node:url').fileURLToPath(new URL('mcp/demo_server.py', baseUrl))"
+    toolCallTimeoutMs: 30000
+    failOnStartupError: false
+
+- id: mcp-kb
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: kb
+    transport: stdio
+    command: !!js process.env.DSH_MCP_KB_PYTHON ?? 'python'
+    args:
+      - !!js "process.getBuiltinModule('node:url').fileURLToPath(new URL('mcp/knowledge_server.py', baseUrl))"
+    toolCallTimeoutMs: 30000
+    failOnStartupError: false
+
+- id: mcp-context7
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: context7
+    transport: stdio
+    command: cmd
+    args:
+      - /c
+      - npx
+      - -y
+      - '@upstash/context7-mcp'
+    env: {}
+
+# 接入真实 MCP 服务器的样例（如 GitHub），按需取消注释：
+# - id: mcp-github
+#   name: '@deepseek-ai/dsh-mcp-client'
+#   config:
+#     serverName: github
+#     transport: stdio
+#     command: npx
+#     args: ['-y', '@modelcontextprotocol/server-github']
+#     env:
+#       GITHUB_TOKEN: !!js process.env.GITHUB_TOKEN ?? ''
+
+# ── SubAgent：工程化拼图第 3 块（也是文章四的多 Agent 协作）──────────────────
+# dsh-subagent 发布 ctx.subagents 注册表；fork provider 向其注册（继承父代理
+# 已完成轮次的前缀）；tool-subagent 把它暴露为模型可见的 `subagent` 工具。
+# one-shot 前台等待（与官方发行组合一致，保 KV cache 前缀）；maxDepth 1 防递归。
+- id: subagents
+  name: '@deepseek-ai/dsh-subagent'
+
+- id: subagent-fork
+  name: '@deepseek-ai/dsh-subagent-fork-in-process'
+
+- id: tool-subagent
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: fork
+    toolName: subagent
+    backgroundMode: one-shot
+    maxDepth: 1
+
+# ── 长会话压缩：Memory/Context 拼图的"该压缩的要压缩"───────────────────────
+# token-meter 提供 4 字符/token 启发式计量；compaction-basic 在压力超限时用
+# 一次性 LLM 摘要替换前缀（复用 KV cache 前缀重放）。全部默认配置。
+- id: token-meter
+  name: '@deepseek-ai/dsh-token-meter'
+
+- id: compaction-basic
+  name: '@deepseek-ai/dsh-compaction-basic'
+
+# ── 会话持久化：未压缩 JSONL（/sessions 与 /resume 直接可读） ────────────────
+- id: sessions
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: !!js process.env.DSH_SESSION_ROOT ?? './.mini-sessions'
+    compression: none

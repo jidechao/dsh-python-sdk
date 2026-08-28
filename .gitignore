@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local session / runtime data
+.mini-sessions/
+.omc/
+.dsh-uploads/
